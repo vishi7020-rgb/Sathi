@@ -6,9 +6,9 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -219,7 +219,7 @@ jobs:
                   col.addView(info)
 
                   val key = EditText(this).apply {
-                      hint = "Anthropic API key"
+                                        hint = "Anthropic API key"
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                       setText(Prefs.key(this@MainActivity))
                   }
@@ -398,4 +398,231 @@ jobs:
                       setPadding(dp(16), dp(12), dp(16), dp(8))
                       background = GradientDrawable().apply { setColor(0xF2172232.toInt()); cornerRadius = dp(16).toFloat() }
                   }
-                  status = TextView(this).apply { setTextColor(Color.WHITE); textSiz
+                  status = TextView(this).apply { setTextColor(Color.WHITE); textSize = 16f; maxLines = 8 }
+                  yesBtn = btn("Haan") { confirm(true) }
+                  noBtn = btn("Nahi") { confirm(false) }
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      addView(yesBtn); addView(noBtn); addView(btn("Band karo") { stopSelf() })
+                  }
+                  c.addView(status); c.addView(row)
+                  val lp = overlay(resources.displayMetrics.widthPixels - dp(32), WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL).apply {
+                      gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = dp(96)
+                  }
+                  wm.addView(c, lp)
+                  card = c
+              }
+
+              private fun show(t: String) {
+                  showCard()
+                  ui.removeCallbacks(hide)
+                  status?.text = t
+                  val vis = if (pending != null) View.VISIBLE else View.GONE
+                  yesBtn?.visibility = vis; noBtn?.visibility = vis
+              }
+
+              private fun removeCard() {
+                                ui.removeCallbacks(hide)
+                  card?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  card = null; status = null; yesBtn = null; noBtn = null
+              }
+
+              private fun scheduleHide(ms: Long) { ui.removeCallbacks(hide); ui.postDelayed(hide, ms) }
+
+              // ---------- Bolna (TTS) ----------
+              private fun initTts() {
+                  tts = TextToSpeech(this) { s ->
+                      if (s == TextToSpeech.SUCCESS) {
+                          tts?.language = Locale("hi", "IN")
+                          tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                              override fun onStart(id: String?) {}
+                              override fun onDone(id: String?) { ui.post { val a = afterSpeak; afterSpeak = null; a?.invoke() } }
+                              @Deprecated("Deprecated in Java")
+                              override fun onError(id: String?) { onDone(id) }
+                          })
+                          ttsReady = true
+                      }
+                  }
+              }
+
+              private fun speak(t: String, after: (() -> Unit)? = null) {
+                  show(t); afterSpeak = after
+                  if (!ttsReady) {
+                      ui.postDelayed({ val a = afterSpeak; afterSpeak = null; a?.invoke() }, 1500)
+                      return
+                  }
+                  tts?.speak(t, TextToSpeech.QUEUE_FLUSH, null, "saathi")
+              }
+
+              // ---------- Sunna (speech recognition) ----------
+              private fun first(b: Bundle?) = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+
+              private fun stopListening() { rec?.let { it.cancel(); it.destroy() }; rec = null }
+
+              private fun listen(m: Int) {
+                  stopListening(); mode = m
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      show("Is phone par speech recognition available nahi hai."); return
+                  }
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  rec = r
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onReadyForSpeech(p: Bundle?) { if (m != 2) show("Sun raha hoon…") }
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(v: Float) {}
+                      override fun onBufferReceived(b: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onEvent(t: Int, b: Bundle?) {}
+                      override fun onPartialResults(b: Bundle?) { if (m != 2) first(b)?.let { show("“$it”") } }
+                      override fun onResults(b: Bundle?) {
+                          val t = first(b); stopListening()
+                          when {
+                              t.isNullOrBlank() -> fail(SpeechRecognizer.ERROR_NO_MATCH)
+                              m == 2 -> confirm(isYes(t))
+                              else -> ask(t)
+                          }
+                      }
+                      override fun onError(e: Int) { stopListening(); fail(e) }
+                  })
+                  r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN") // English ke liye "en-IN"
+                      putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                  })
+              }
+
+              private fun fail(e: Int) {
+                  val quiet = e == SpeechRecognizer.ERROR_NO_MATCH || e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                  when {
+                      mode == 2 -> { pending = null; speak("Jawab nahi suna, isliye cancel kar diya.") { scheduleHide(2000) } }
+                      mode == 1 && quiet -> removeCard()
+                      quiet -> { show("Kuch suna nahi. Bubble dobara dabao."); scheduleHide(3000) }
+                      e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ->
+                          show("Mic permission chahiye. Saathi app kholke permission do.")
+                      else -> { show("Awaaz samajh nahi aayi (code $e)."); scheduleHide(3000) }
+                  }
+              }
+
+              // ---------- Claude se baat ----------
+              private fun ask(text: String) {
+                  val key = Prefs.key(this)
+                  if (key.isBlank()) { speak("API key nahi mili. Saathi app kholke key daalo.") { scheduleHide(3000) }; return }
+                  history.add("user" to text)
+                  while (history.size > 12 || (history.isNotEmpty() && history[0].first != "user")) history.removeAt(0)
+                  show("“$text”\nSoch raha hoon…")
+                  val snap = history.toList()
+                  io.execute {
+                      val r = runCatching { Claude.ask(key, snap) }
+                      ui.post {
+                          r.onSuccess { handle(it) }.onFailure {
+                              history.removeLastOrNull()
+                              speak(errMsg(it)) { scheduleHide(4000) }
+                          }
+                      }
+                  }
+              }
+
+              private fun errMsg(e: Throwable) = when {
+                  e is ApiError && e.code == 401 -> "API key galat lagti hai. Saathi app mein dobara daalo."
+                  e is ApiError && e.code == 429 -> "Bahut zyada requests ho gayi. Thodi der baad try karo."
+                  e is ApiError -> "Server se jawab nahi aaya, code ${e.code}."
+                  e is java.io.IOException -> "Internet nahi chal raha."
+                  else -> "Kuch gadbad ho gayi."
+              }
+
+              private fun handle(r: Reply) {
+                  val tool = r.tool; val input = r.input
+                  if (tool != null && input != null) {
+                      val d = describe(tool, input)
+                      if (d == null) {
+                          history.add("assistant" to "(ye kaam nahi ho paya)")
+                          speak("Ye kaam mere bas mein nahi hai.") { scheduleHide(3000) }
+                          return
+                      }
+                      history.add("assistant" to d)
+                      pending = { run(tool, input) }
+                      speak("$d Karoon? Haan ya nahi bolo.") { listen(2) }
+                      return
+                  }
+                  val t = r.text.ifBlank { "Samajh nahi aaya, dobara bolo." }
+                  history.add("assistant" to t)
+                  speak(t) { listen(1) }
+              }
+
+              // ---------- Phone ke kaam (sirf confirm ke baad) ----------
+              private fun fmt(s: Int): String {
+                  val parts = ArrayList<String>()
+                  if (s / 3600 > 0) parts.add("${s / 3600} ghanta")
+                  if (s % 3600 / 60 > 0) parts.add("${s % 3600 / 60} minute")
+                  if (s % 60 > 0) parts.add("${s % 60} second")
+                  return parts.joinToString(" ")
+              }
+
+              private fun describe(tool: String, i: JSONObject): String? = when (tool) {
+                  "set_alarm" -> {
+                      val h = i.optInt("hour", -1); val m = i.optInt("minute", -1)
+                      if (h in 0..23 && m in 0..59) "%02d:%02d baje ka alarm set".format(h, m) else null
+                  }
+                  "set_timer" -> {
+                      val s = i.optInt("seconds", -1)
+                      if (s in 1..86400) "${fmt(s)} ka timer" else null
+                  }
+                  else -> null
+              }
+
+              private fun run(tool: String, i: JSONObject) {
+                  val label = i.optString("label", "Saathi")
+                  val intent = when (tool) {
+                      "set_alarm" -> Intent(AlarmClock.ACTION_SET_ALARM)
+                          .putExtra(AlarmClock.EXTRA_HOUR, i.getInt("hour"))
+                          .putExtra(AlarmClock.EXTRA_MINUTES, i.getInt("minute"))
+                      "set_timer" -> Intent(AlarmClock.ACTION_SET_TIMER)
+                          .putExtra(AlarmClock.EXTRA_LENGTH, i.getInt("seconds"))
+                      else -> return
+                  }.putExtra(AlarmClock.EXTRA_MESSAGE, label)
+                      .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  try {
+                      startActivity(intent); speak("Ho gaya.") { scheduleHide(2500) }
+                  } catch (_: Exception) {
+                      speak("Ye phone par nahi ho paya.") { scheduleHide(3000) }
+                  }
+              }
+
+              private fun confirm(yes: Boolean) {
+                  tts?.stop(); afterSpeak = null; stopListening()
+                  val p = pending; pending = null
+                  if (yes && p != null) p() else speak("Theek hai, cancel kar diya.") { scheduleHide(2000) }
+              }
+
+              private fun isYes(t: String): Boolean {
+                  val w = t.lowercase().split(Regex("[\\s,.!?]+"))
+                  val no = setOf("nahi", "nahin", "no", "mat", "cancel", "ruko", "na", "नहीं", "नही", "मत", "रुको", "ना")
+                  val yes = setOf("haan", "han", "ha", "haa", "yes", "yeah", "ok", "okay", "theek", "thik",
+                      "kar", "karo", "kardo", "ji", "हाँ", "हां", "हा", "ठीक", "जी")
+                  return w.none { it in no } && w.any { it in yes }
+              }
+
+              override fun onDestroy() {
+                  ui.removeCallbacksAndMessages(null)
+                  stopListening(); tts?.shutdown(); io.shutdownNow()
+                  removeCard()
+                  bubble?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                  super.onDestroy()
+              }
+          }
+          SAATHI_EOF
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: APK banao
+        working-directory: Saathi
+        run: gradle assembleDebug --no-daemon
+      - name: Release mein daalo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" Saathi/app/build/outputs/apk/debug/app-debug.apk --title "Saathi APK ${{ github.run_number }}" --notes "Debug APK"
+          
