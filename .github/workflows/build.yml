@@ -1,0 +1,401 @@
+name: Build Saathi APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Project files banao
+        run: |
+          mkdir -p Saathi/app/src/main/java/com/saathi/app
+          cat > Saathi/settings.gradle.kts <<'SAATHI_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Saathi"
+          include(":app")
+          SAATHI_EOF
+          cat > Saathi/build.gradle.kts <<'SAATHI_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          SAATHI_EOF
+          cat > Saathi/gradle.properties <<'SAATHI_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          SAATHI_EOF
+          cat > Saathi/app/build.gradle.kts <<'SAATHI_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.saathi.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.saathi.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.security:security-crypto:1.1.0-alpha06")
+          }
+          SAATHI_EOF
+          cat > Saathi/app/src/main/AndroidManifest.xml <<'SAATHI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+              <queries>
+                  <intent><action android:name="android.speech.RecognitionService" /></intent>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Saathi"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".BubbleService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          SAATHI_EOF
+          cat > Saathi/app/src/main/java/com/saathi/app/Prefs.kt <<'SAATHI_EOF'
+          package com.saathi.app
+
+          import android.content.Context
+          import androidx.security.crypto.EncryptedSharedPreferences
+          import androidx.security.crypto.MasterKey
+
+          // API key phone mein encrypted rehti hai (Android Keystore).
+          object Prefs {
+              private fun sp(c: Context) = EncryptedSharedPreferences.create(
+                  c, "saathi_secure",
+                  MasterKey.Builder(c).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+                  EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                  EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+              )
+              fun key(c: Context): String = sp(c).getString("k", "") ?: ""
+              fun setKey(c: Context, v: String) = sp(c).edit().putString("k", v.trim()).apply()
+          }
+          SAATHI_EOF
+          cat > Saathi/app/src/main/java/com/saathi/app/Claude.kt <<'SAATHI_EOF'
+          package com.saathi.app
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class ApiError(val code: Int) : IOException("HTTP $code")
+
+          data class Reply(val text: String, val tool: String? = null, val input: JSONObject? = null)
+
+          object Claude {
+              private const val MODEL = "claude-sonnet-5-5"
+
+              private const val SYSTEM =
+                  "Tum Saathi ho, ek voice personal assistant. Jawab Hinglish mein, Roman script mein do " +
+                  "(sirf tab English, jab user English mein baat kare). Jawab bolke sunaya jayega, isliye " +
+                  "1 se 3 chhote vakya, koi markdown, list ya emoji nahi. Alarm ya timer tabhi lagao jab user " +
+                  "saaf bole, aur uske liye tool use karo. Tum khud kuch nahi karte, app user se haan puchhegi. " +
+                  "Tumhare paas internet nahi hai; kisi baat ka pakka pata na ho to saaf bolo."
+
+              private fun tools() = JSONArray()
+                  .put(JSONObject()
+                      .put("name", "set_alarm")
+                      .put("description", "Phone mein alarm set karne ka prastav (user confirm karega).")
+                      .put("input_schema", JSONObject()
+                          .put("type", "object")
+                          .put("properties", JSONObject()
+                              .put("hour", JSONObject().put("type", "integer").put("description", "0 se 23"))
+                              .put("minute", JSONObject().put("type", "integer").put("description", "0 se 59"))
+                              .put("label", JSONObject().put("type", "string")))
+                          .put("required", JSONArray().put("hour").put("minute"))))
+                  .put(JSONObject()
+                      .put("name", "set_timer")
+                      .put("description", "Countdown timer ka prastav (user confirm karega).")
+                      .put("input_schema", JSONObject()
+                          .put("type", "object")
+                          .put("properties", JSONObject()
+                              .put("seconds", JSONObject().put("type", "integer").put("description", "Total seconds"))
+                              .put("label", JSONObject().put("type", "string")))
+                          .put("required", JSONArray().put("seconds"))))
+
+              fun ask(key: String, history: List<Pair<String, String>>): Reply {
+                  val msgs = JSONArray()
+                  history.forEach { (r, c) -> msgs.put(JSONObject().put("role", r).put("content", c)) }
+                  val body = JSONObject()
+                      .put("model", MODEL).put("max_tokens", 500)
+                      .put("system", SYSTEM).put("messages", msgs).put("tools", tools())
+
+                  val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.connectTimeout = 15000
+                  c.readTimeout = 60000
+                  c.doOutput = true
+                  c.setRequestProperty("x-api-key", key)
+                  c.setRequestProperty("anthropic-version", "2023-06-01")
+                  c.setRequestProperty("content-type", "application/json")
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+
+                  val code = c.responseCode
+                  if (code !in 200..299) throw ApiError(code)
+                  val res = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+
+                  val blocks = res.getJSONArray("content")
+                  var text = ""
+                  var tool: String? = null
+                  var input: JSONObject? = null
+                  for (i in 0 until blocks.length()) {
+                      val b = blocks.getJSONObject(i)
+                      when (b.optString("type")) {
+                          "text" -> text += b.optString("text")
+                          "tool_use" -> if (tool == null) { tool = b.optString("name"); input = b.optJSONObject("input") }
+                      }
+                  }
+                  return Reply(text.trim(), tool, input)
+              }
+          }
+          SAATHI_EOF
+          cat > Saathi/app/src/main/java/com/saathi/app/MainActivity.kt <<'SAATHI_EOF'
+          package com.saathi.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              private lateinit var info: TextView
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val p = (20 * resources.displayMetrics.density).toInt()
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(p, p * 2, p, p) }
+                  col.addView(TextView(this).apply { text = "Saathi"; textSize = 28f })
+                  info = TextView(this).apply { text = "Neeche ke steps ek ek karke poore karo."; setPadding(0, p / 2, 0, p / 2) }
+                  col.addView(info)
+
+                  val key = EditText(this).apply {
+                      hint = "Anthropic API key"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setText(Prefs.key(this@MainActivity))
+                  }
+                  col.addView(key)
+                  fun add(label: String, f: () -> Unit) =
+                      col.addView(Button(this).apply { text = label; isAllCaps = false; setOnClickListener { f() } })
+
+                  add("1. API key save karo") {
+                      Prefs.setKey(this, key.text.toString()); info.text = "Key save ho gayi."
+                  }
+                  add("2. Overlay permission do") {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                  }
+                  add("3. Mic aur notification permission do") {
+                      val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                      if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                      requestPermissions(perms.toTypedArray(), 1)
+                  }
+                  add("4. Saathi bubble shuru karo") {
+                      Prefs.setKey(this, key.text.toString())
+                      when {
+                          Prefs.key(this).isBlank() -> info.text = "Pehle API key daalo."
+                          !Settings.canDrawOverlays(this) -> info.text = "Step 2: overlay permission do."
+                          checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED ->
+                              info.text = "Step 3: mic permission do."
+                          else -> {
+                              startForegroundService(Intent(this, BubbleService::class.java))
+                              moveTaskToBack(true)
+                          }
+                      }
+                  }
+                  add("Saathi band karo") {
+                      stopService(Intent(this, BubbleService::class.java)); info.text = "Saathi band ho gaya."
+                  }
+                  setContentView(ScrollView(this).apply { addView(col) })
+              }
+          }
+          SAATHI_EOF
+          cat > Saathi/app/src/main/java/com/saathi/app/BubbleService.kt <<'SAATHI_EOF'
+          package com.saathi.app
+
+          import android.annotation.SuppressLint
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.AlarmClock
+          import android.provider.Settings
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+          import org.json.JSONObject
+          import java.util.Locale
+          import java.util.concurrent.Executors
+          import kotlin.math.abs
+
+          class BubbleService : Service() {
+              private val ui = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
+              private lateinit var wm: WindowManager
+              private var bubble: View? = null
+              private var card: LinearLayout? = null
+              private var status: TextView? = null
+              private var yesBtn: Button? = null
+              private var noBtn: Button? = null
+              private var rec: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var afterSpeak: (() -> Unit)? = null
+              private var pending: (() -> Unit)? = null
+              private var mode = 0 // 0 = pehli baar sunna, 1 = follow-up, 2 = haan/nahi
+              private val history = ArrayList<Pair<String, String>>()
+              private val hide = Runnable { removeCard() }
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  if (i?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
+                  startAsForeground()
+                  if (!Settings.canDrawOverlays(this)) { stopSelf(); return START_NOT_STICKY }
+                  if (bubble == null) { addBubble(); initTts() }
+                  return START_NOT_STICKY
+              }
+
+              private fun startAsForeground() {
+                  getSystemService(NotificationManager::class.java)
+                      .createNotificationChannel(NotificationChannel("saathi", "Saathi", NotificationManager.IMPORTANCE_LOW))
+                  val stop = PendingIntent.getService(
+                      this, 0, Intent(this, BubbleService::class.java).setAction("STOP"), PendingIntent.FLAG_IMMUTABLE)
+                  val n = NotificationCompat.Builder(this, "saathi")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentTitle("Saathi chal raha hai")
+                      .setContentText("Bubble dabao aur bolo")
+                      .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Band karo", stop)
+                      .setOngoing(true).build()
+                  ServiceCompat.startForeground(this, 1, n,
+                      if (Build.VERSION.SDK_INT >= 30) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0)
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun overlay(w: Int, h: Int, flags: Int) = WindowManager.LayoutParams(
+                  w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT)
+
+              // ---------- Floating bubble ----------
+              @SuppressLint("ClickableViewAccessibility")
+              private fun addBubble() {
+                  val size = dp(60)
+                  val lp = overlay(size, size, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE).apply {
+                      gravity = Gravity.TOP or Gravity.START; x = dp(8); y = dp(220)
+                  }
+                  val v = ImageView(this).apply {
+                      setImageResource(android.R.drawable.ic_btn_speak_now)
+                      setColorFilter(Color.WHITE)
+                      setPadding(dp(16), dp(16), dp(16), dp(16))
+                      background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(0xFF2849D6.toInt()) }
+                  }
+                  var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
+                  v.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY; moved = false }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
+                              if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                              lp.x = sx + dx; lp.y = sy + dy
+                              wm.updateViewLayout(v, lp)
+                          }
+                          MotionEvent.ACTION_UP -> if (!moved) onBubbleTap()
+                      }
+                      true
+                  }
+                  wm.addView(v, lp)
+                  bubble = v
+              }
+
+              private fun onBubbleTap() {
+                  tts?.stop(); afterSpeak = null; pending = null
+                  ui.removeCallbacks(hide)
+                  listen(0)
+              }
+
+              // ---------- Popup card ----------
+              private fun showCard() {
+                  if (card != null) return
+                  fun btn(label: String, f: () -> Unit) =
+                      Button(this).apply { text = label; isAllCaps = false; setOnClickListener { f() } }
+                  val c = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(12), dp(16), dp(8))
+                      background = GradientDrawable().apply { setColor(0xF2172232.toInt()); cornerRadius = dp(16).toFloat() }
+                  }
+                  status = TextView(this).apply { setTextColor(Color.WHITE); textSiz
