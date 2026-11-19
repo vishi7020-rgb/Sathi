@@ -113,7 +113,7 @@ jobs:
               fun setKey(c: Context, v: String) = sp(c).edit().putString("k", v.trim()).apply()
           }
           SAATHI_EOF
-          cat > Saathi/app/src/main/java/com/saathi/app/Claude.kt <<'SAATHI_EOF'
+          cat > Saathi/app/src/main/java/com/saathi/app/Gemini.kt <<'SAATHI_EOF'
           package com.saathi.app
 
           import org.json.JSONArray
@@ -126,67 +126,100 @@ jobs:
 
           data class Reply(val text: String, val tool: String? = null, val input: JSONObject? = null)
 
-          object Claude {
-              private const val MODEL = "claude-sonnet-5-5"
+          object Gemini {
+              // Pehla model na mile (404) to agla try hota hai.
+              private val MODELS = listOf("gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.6-flash")
 
               private const val SYSTEM =
                   "Tum Saathi ho, ek voice personal assistant. Jawab Hinglish mein, Roman script mein do " +
                   "(sirf tab English, jab user English mein baat kare). Jawab bolke sunaya jayega, isliye " +
                   "1 se 3 chhote vakya, koi markdown, list ya emoji nahi. Alarm ya timer tabhi lagao jab user " +
-                  "saaf bole, aur uske liye tool use karo. Tum khud kuch nahi karte, app user se haan puchhegi. " +
+                  "saaf bole, aur uske liye function call karo. Tum khud kuch nahi karte, app user se haan puchhegi. " +
                   "Tumhare paas internet nahi hai; kisi baat ka pakka pata na ho to saaf bolo."
 
-              private fun tools() = JSONArray()
-                  .put(JSONObject()
-                      .put("name", "set_alarm")
-                      .put("description", "Phone mein alarm set karne ka prastav (user confirm karega).")
-                      .put("input_schema", JSONObject()
-                          .put("type", "object")
-                          .put("properties", JSONObject()
-                              .put("hour", JSONObject().put("type", "integer").put("description", "0 se 23"))
-                              .put("minute", JSONObject().put("type", "integer").put("description", "0 se 59"))
-                              .put("label", JSONObject().put("type", "string")))
-                          .put("required", JSONArray().put("hour").put("minute"))))
-                  .put(JSONObject()
-                      .put("name", "set_timer")
-                      .put("description", "Countdown timer ka prastav (user confirm karega).")
-                      .put("input_schema", JSONObject()
-                          .put("type", "object")
-                          .put("properties", JSONObject()
-                              .put("seconds", JSONObject().put("type", "integer").put("description", "Total seconds"))
-                              .put("label", JSONObject().put("type", "string")))
-                          .put("required", JSONArray().put("seconds"))))
+              private fun prop(type: String, desc: String) = JSONObject().put("type", type).put("description", desc)
+
+              private fun fn(name: String, desc: String, props: JSONObject, req: List<String>) = JSONObject()
+                  .put("name", name)
+                  .put("description", desc)
+                  .put("parameters", JSONObject()
+                      .put("type", "OBJECT")
+                      .put("properties", props)
+                      .put("required", JSONArray(req)))
+
+              private fun tools(): JSONArray {
+                  val alarm = fn(
+                      "set_alarm", "Phone mein alarm set karne ka prastav (user confirm karega).",
+                      JSONObject()
+                          .put("hour", prop("INTEGER", "0 se 23"))
+                          .put("minute", prop("INTEGER", "0 se 59"))
+                          .put("label", prop("STRING", "Alarm ka naam")),
+                      listOf("hour", "minute"))
+                  val timer = fn(
+                      "set_timer", "Countdown timer ka prastav (user confirm karega).",
+                      JSONObject()
+                          .put("seconds", prop("INTEGER", "Total seconds"))
+                          .put("label", prop("STRING", "Timer ka naam")),
+                      listOf("seconds"))
+                  return JSONArray().put(JSONObject().put("functionDeclarations", JSONArray().put(alarm).put(timer)))
+              }
 
               fun ask(key: String, history: List<Pair<String, String>>): Reply {
-                  val msgs = JSONArray()
-                  history.forEach { (r, c) -> msgs.put(JSONObject().put("role", r).put("content", c)) }
-                  val body = JSONObject()
-                      .put("model", MODEL).put("max_tokens", 500)
-                      .put("system", SYSTEM).put("messages", msgs).put("tools", tools())
+                  val contents = JSONArray()
+                  history.forEach { (r, c) ->
+                      contents.put(JSONObject()
+                          .put("role", if (r == "assistant") "model" else "user")
+                          .put("parts", JSONArray().put(JSONObject().put("text", c))))
+                  }
+                  var last: ApiError? = null
+                  for (m in MODELS) {
+                      try {
+                          return call(key, m, contents)
+                      } catch (e: ApiError) {
+                          if (e.code != 404) throw e
+                          last = e
+                      }
+                  }
+                  throw last ?: ApiError(404)
+              }
 
-                  val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+              private fun call(key: String, model: String, contents: JSONArray): Reply {
+                  val gen = JSONObject().put("maxOutputTokens", 1024)
+                  if (model.startsWith("gemini-2.5")) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                  val body = JSONObject()
+                      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
+                      .put("contents", contents)
+                      .put("tools", tools())
+                      .put("generationConfig", gen)
+
+                  val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+                      .openConnection() as HttpURLConnection
                   c.requestMethod = "POST"
                   c.connectTimeout = 15000
                   c.readTimeout = 60000
                   c.doOutput = true
-                  c.setRequestProperty("x-api-key", key)
-                  c.setRequestProperty("anthropic-version", "2023-06-01")
-                  c.setRequestProperty("content-type", "application/json")
+                  c.setRequestProperty("x-goog-api-key", key)
+                  c.setRequestProperty("Content-Type", "application/json")
                   c.outputStream.use { it.write(body.toString().toByteArray()) }
 
                   val code = c.responseCode
                   if (code !in 200..299) throw ApiError(code)
                   val res = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
 
-                  val blocks = res.getJSONArray("content")
+                  val parts = res.optJSONArray("candidates")?.optJSONObject(0)
+                      ?.optJSONObject("content")?.optJSONArray("parts")
                   var text = ""
                   var tool: String? = null
                   var input: JSONObject? = null
-                  for (i in 0 until blocks.length()) {
-                      val b = blocks.getJSONObject(i)
-                      when (b.optString("type")) {
-                          "text" -> text += b.optString("text")
-                          "tool_use" -> if (tool == null) { tool = b.optString("name"); input = b.optJSONObject("input") }
+                  if (parts != null) {
+                      for (i in 0 until parts.length()) {
+                          val p = parts.getJSONObject(i)
+                          if (!p.optBoolean("thought", false)) text += p.optString("text", "")
+                          val fc = p.optJSONObject("functionCall")
+                          if (fc != null && tool == null) {
+                              tool = fc.optString("name")
+                              input = fc.optJSONObject("args") ?: JSONObject()
+                          }
                       }
                   }
                   return Reply(text.trim(), tool, input)
@@ -200,7 +233,7 @@ jobs:
           import android.app.Activity
           import android.content.Intent
           import android.content.pm.PackageManager
-          import android.net.Uri
+                    import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
@@ -219,7 +252,7 @@ jobs:
                   col.addView(info)
 
                   val key = EditText(this).apply {
-                                        hint = "Anthropic API key"
+                      hint = "Gemini API key (aistudio.google.com se)"
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                       setText(Prefs.key(this@MainActivity))
                   }
@@ -411,7 +444,7 @@ jobs:
                       gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = dp(96)
                   }
                   wm.addView(c, lp)
-                  card = c
+                                    card = c
               }
 
               private fun show(t: String) {
@@ -423,7 +456,7 @@ jobs:
               }
 
               private fun removeCard() {
-                                ui.removeCallbacks(hide)
+                  ui.removeCallbacks(hide)
                   card?.let { try { wm.removeView(it) } catch (_: Exception) {} }
                   card = null; status = null; yesBtn = null; noBtn = null
               }
@@ -504,7 +537,7 @@ jobs:
                   }
               }
 
-              // ---------- Claude se baat ----------
+              // ---------- Gemini se baat ----------
               private fun ask(text: String) {
                   val key = Prefs.key(this)
                   if (key.isBlank()) { speak("API key nahi mili. Saathi app kholke key daalo.") { scheduleHide(3000) }; return }
@@ -513,7 +546,7 @@ jobs:
                   show("“$text”\nSoch raha hoon…")
                   val snap = history.toList()
                   io.execute {
-                      val r = runCatching { Claude.ask(key, snap) }
+                      val r = runCatching { Gemini.ask(key, snap) }
                       ui.post {
                           r.onSuccess { handle(it) }.onFailure {
                               history.removeLastOrNull()
@@ -524,7 +557,8 @@ jobs:
               }
 
               private fun errMsg(e: Throwable) = when {
-                  e is ApiError && e.code == 401 -> "API key galat lagti hai. Saathi app mein dobara daalo."
+                  e is ApiError && (e.code == 401 || e.code == 403) -> "API key galat ya band lagti hai. Saathi app mein dobara daalo."
+                  e is ApiError && e.code == 400 -> "API key ya request mein gadbad hai, code 400. Key dobara check karo."
                   e is ApiError && e.code == 429 -> "Bahut zyada requests ho gayi. Thodi der baad try karo."
                   e is ApiError -> "Server se jawab nahi aaya, code ${e.code}."
                   e is java.io.IOException -> "Internet nahi chal raha."
