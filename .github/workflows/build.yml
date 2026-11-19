@@ -59,12 +59,14 @@ jobs:
           dependencies {
               implementation("androidx.core:core-ktx:1.13.1")
               implementation("androidx.security:security-crypto:1.1.0-alpha06")
+              implementation("ai.picovoice:porcupine-android:[3.0.0,5.0.0)")
           }
           SAATHI_EOF
           cat > Saathi/app/src/main/AndroidManifest.xml <<'SAATHI_EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
               <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -73,6 +75,10 @@ jobs:
               <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
 
               <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
                   <intent><action android:name="android.speech.RecognitionService" /></intent>
                   <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
               </queries>
@@ -143,19 +149,57 @@ jobs:
           package com.saathi.app
 
           import android.content.Context
+          import android.content.SharedPreferences
           import androidx.security.crypto.EncryptedSharedPreferences
           import androidx.security.crypto.MasterKey
+          import org.json.JSONArray
 
-          // API key phone mein encrypted rehti hai (Android Keystore).
+          // API key aur yaaddasht phone mein encrypted rehti hain (Android Keystore).
           object Prefs {
-              private fun sp(c: Context) = EncryptedSharedPreferences.create(
-                  c, "saathi_secure",
-                  MasterKey.Builder(c).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
-                  EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                  EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-              )
+              private var cached: SharedPreferences? = null
+
+              private fun sp(c: Context): SharedPreferences {
+                  cached?.let { return it }
+                  val app = c.applicationContext
+                  val s = EncryptedSharedPreferences.create(
+                      app, "saathi_secure",
+                      MasterKey.Builder(app).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+                      EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                      EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+                  )
+                  cached = s
+                  return s
+              }
+
               fun key(c: Context): String = sp(c).getString("k", "") ?: ""
               fun setKey(c: Context, v: String) = sp(c).edit().putString("k", v.trim()).apply()
+
+              fun pvKey(c: Context): String = sp(c).getString("pv", "") ?: ""
+              fun setPvKey(c: Context, v: String) = sp(c).edit().putString("pv", v.trim()).apply()
+
+              fun memory(c: Context): List<String> = try {
+                  val a = JSONArray(sp(c).getString("mem", "[]"))
+                  List(a.length()) { a.getString(it) }
+              } catch (e: Exception) {
+                  emptyList()
+              }
+
+              private fun setMem(c: Context, l: List<String>) =
+                  sp(c).edit().putString("mem", JSONArray(l).toString()).apply()
+
+              fun addMemory(c: Context, s: String) {
+                  if (s.isBlank()) return
+                  setMem(c, (memory(c) + s.trim()).takeLast(60))
+              }
+
+              // keyword "*" = sab kuch bhula do. Kitni baatein hatayi, wo number lautata hai.
+              fun forget(c: Context, kw: String): Int {
+                  val k = kw.trim().lowercase()
+                  val all = memory(c)
+                  val keep = if (k == "*") emptyList<String>() else all.filter { !it.lowercase().contains(k) }
+                  setMem(c, keep)
+                  return all.size - keep.size
+              }
           }
           SAATHI_EOF
           cat > Saathi/app/src/main/java/com/saathi/app/Gemini.kt <<'SAATHI_EOF'
@@ -166,6 +210,9 @@ jobs:
           import java.io.IOException
           import java.net.HttpURLConnection
           import java.net.URL
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           class ApiError(val code: Int) : IOException("HTTP $code")
 
@@ -177,12 +224,20 @@ jobs:
 
               private const val SYSTEM =
                   "Tum Jarvis ho, ek voice personal assistant. Jawab Hinglish mein, Roman script mein do " +
-                  "(sirf tab English, jab user English mein baat kare). Jawab bolke sunaya jayega, isliye " +
-                  "1 se 3 chhote vakya, koi markdown, list ya emoji nahi. Alarm ya timer tabhi lagao jab user " +
-                  "saaf bole, aur uske liye function call karo. Tum khud kuch nahi karte, app user se haan puchhegi. " +
-                  "Tumhare paas internet nahi hai; kisi baat ka pakka pata na ho to saaf bolo."
+                                    "(sirf tab English, jab user English mein baat kare). Jawab bolke sunaya jayega, isliye " +
+                  "1 se 3 chhote vakya, koi markdown, list ya emoji nahi. Phone ke kaam (alarm, timer, call, " +
+                  "WhatsApp, app kholna, maps, YouTube) ke liye function call karo; tum khud kuch nahi karte, " +
+                  "call, message, alarm aur timer se pehle app user se haan puchhegi. Jab user kahe yaad rakhna, " +
+                  "remember function use karo. Taaza jaankari (khabar, score, mausam, price) ke liye web_search " +
+                  "function use karo. Kisi baat ka pakka pata na ho to saaf bolo."
 
               private fun prop(type: String, desc: String) = JSONObject().put("type", type).put("description", desc)
+
+              private fun props(vararg p: Pair<String, JSONObject>): JSONObject {
+                  val o = JSONObject()
+                  p.forEach { o.put(it.first, it.second) }
+                  return o
+              }
 
               private fun fn(name: String, desc: String, props: JSONObject, req: List<String>) = JSONObject()
                   .put("name", name)
@@ -193,33 +248,58 @@ jobs:
                       .put("required", JSONArray(req)))
 
               private fun tools(): JSONArray {
-                  val alarm = fn(
-                      "set_alarm", "Phone mein alarm set karne ka prastav (user confirm karega).",
-                      JSONObject()
-                          .put("hour", prop("INTEGER", "0 se 23"))
-                          .put("minute", prop("INTEGER", "0 se 59"))
-                          .put("label", prop("STRING", "Alarm ka naam")),
-                      listOf("hour", "minute"))
-                  val timer = fn(
-                      "set_timer", "Countdown timer ka prastav (user confirm karega).",
-                      JSONObject()
-                          .put("seconds", prop("INTEGER", "Total seconds"))
-                          .put("label", prop("STRING", "Timer ka naam")),
-                      listOf("seconds"))
-                  return JSONArray().put(JSONObject().put("functionDeclarations", JSONArray().put(alarm).put(timer)))
+                  val text = { d: String -> prop("STRING", d) }
+                  val decl = JSONArray()
+                      .put(fn("set_alarm", "Alarm set karne ka prastav.",
+                          props("hour" to prop("INTEGER", "0 se 23"), "minute" to prop("INTEGER", "0 se 59"),
+                              "label" to text("Alarm ka naam")), listOf("hour", "minute")))
+                      .put(fn("set_timer", "Countdown timer ka prastav.",
+                          props("seconds" to prop("INTEGER", "Total seconds"), "label" to text("Timer ka naam")),
+                          listOf("seconds")))
+                      .put(fn("call_contact", "Kisi ko call karne ke liye dialer kholna.",
+                          props("to" to text("Contact ka naam Roman script mein, jaise Mummy, ya phone number")),
+                          listOf("to")))
+                      .put(fn("whatsapp_message", "WhatsApp par message ka draft kholna. User khud send dabata hai.",
+                          props("to" to text("Contact ka naam Roman script mein, ya phone number"),
+                              "text" to text("Message ka text")), listOf("to", "text")))
+                      .put(fn("open_app", "Phone ki koi app kholna.",
+                          props("app" to text("App ka naam English mein, jaise WhatsApp, YouTube, Camera, Settings")),
+                          listOf("app")))
+                      .put(fn("navigate_to", "Google Maps mein jagah dhoondhna ya rasta dikhana.",
+                          props("place" to text("Jagah ka naam")), listOf("place")))
+                      .put(fn("play_youtube", "YouTube par kuch dhoondhna ya chalana.",
+                          props("query" to text("Kya dhoondhna hai")), listOf("query")))
+                      .put(fn("remember", "User ne jo baat yaad rakhne ko kaha, use save karna.",
+                          props("fact" to text("Chhota, saaf vakya, jaise: User ki gaadi ka number UP32 1234")),
+                          listOf("fact")))
+                      .put(fn("forget", "Yaad ki hui baatein bhulana. Sab bhulane ke liye keyword * dena.",
+                          props("keyword" to text("Jis baat ko bhulana hai uska ek shabd")), listOf("keyword")))
+                      .put(fn("web_search", "Taaza khabar, score, mausam, price ya internet ki jaankari chahiye ho tab.",
+                          props("query" to text("Search query")), listOf("query")))
+                  return JSONArray().put(JSONObject().put("functionDeclarations", decl))
               }
 
-              fun ask(key: String, history: List<Pair<String, String>>): Reply {
-                  val contents = JSONArray()
-                  history.forEach { (r, c) ->
-                      contents.put(JSONObject()
-                          .put("role", if (r == "assistant") "model" else "user")
-                          .put("parts", JSONArray().put(JSONObject().put("text", c))))
-                  }
+              private fun system(memory: List<String>): String {
+                  val now = SimpleDateFormat("EEEE, d MMMM yyyy, hh:mm a", Locale("en", "IN")).format(Date())
+                  val mem = if (memory.isEmpty()) "" else
+                      "\nUser ke baare mein yaad rakhi baatein:\n" + memory.joinToString("\n") { "- $it" }
+                  return SYSTEM + "\nAbhi ka samay: " + now + mem
+              }
+
+              private fun sysInstr(t: String) =
+                  JSONObject().put("parts", JSONArray().put(JSONObject().put("text", t)))
+
+              private fun gen(m: String): JSONObject {
+                  val g = JSONObject().put("maxOutputTokens", 1024)
+                  if (m.startsWith("gemini-2.5")) g.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
+                  return g
+              }
+
+              private fun withModels(f: (String) -> JSONObject): JSONObject {
                   var last: ApiError? = null
                   for (m in MODELS) {
                       try {
-                          return call(key, m, contents)
+                          return f(m)
                       } catch (e: ApiError) {
                           if (e.code != 404) throw e
                           last = e
@@ -228,46 +308,78 @@ jobs:
                   throw last ?: ApiError(404)
               }
 
-              private fun call(key: String, model: String, contents: JSONArray): Reply {
-                  val gen = JSONObject().put("maxOutputTokens", 1024)
-                  if (model.startsWith("gemini-2.5")) gen.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
-                  val body = JSONObject()
-                      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
-                      .put("contents", contents)
-                      .put("tools", tools())
-                      .put("generationConfig", gen)
-
+              private fun post(key: String, model: String, body: JSONObject): JSONObject {
                   val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
                       .openConnection() as HttpURLConnection
                   c.requestMethod = "POST"
                   c.connectTimeout = 15000
-                                    c.readTimeout = 60000
+                  c.readTimeout = 60000
                   c.doOutput = true
                   c.setRequestProperty("x-goog-api-key", key)
                   c.setRequestProperty("Content-Type", "application/json")
                   c.outputStream.use { it.write(body.toString().toByteArray()) }
-
                   val code = c.responseCode
                   if (code !in 200..299) throw ApiError(code)
-                  val res = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+                  return JSONObject(c.inputStream.bufferedReader().use { it.readText() })
+              }
 
-                  val parts = res.optJSONArray("candidates")?.optJSONObject(0)
-                      ?.optJSONObject("content")?.optJSONArray("parts")
-                  var text = ""
+              private fun partsOf(res: JSONObject): JSONArray? = res.optJSONArray("candidates")
+                  ?.optJSONObject(0)?.optJSONObject("content")?.optJSONArray("parts")
+
+              private fun textOf(parts: JSONArray?): String {
+                  var t = ""
+                  if (parts != null) {
+                      for (i in 0 until parts.length()) {
+                          val p = parts.getJSONObject(i)
+                          if (!p.optBoolean("thought", false)) t += p.optString("text", "")
+                      }
+                  }
+                  return t.trim()
+              }
+
+              fun ask(key: String, history: List<Pair<String, String>>, memory: List<String>): Reply {
+                  val contents = JSONArray()
+                  history.forEach { (r, c) ->
+                      contents.put(JSONObject()
+                          .put("role", if (r == "assistant") "model" else "user")
+                          .put("parts", JSONArray().put(JSONObject().put("text", c))))
+                  }
+                  val res = withModels { m ->
+                      post(key, m, JSONObject()
+                          .put("systemInstruction", sysInstr(system(memory)))
+                          .put("contents", contents)
+                          .put("tools", tools())
+                          .put("generationConfig", gen(m)))
+                  }
+                  val parts = partsOf(res)
                   var tool: String? = null
                   var input: JSONObject? = null
                   if (parts != null) {
                       for (i in 0 until parts.length()) {
-                          val p = parts.getJSONObject(i)
-                          if (!p.optBoolean("thought", false)) text += p.optString("text", "")
-                          val fc = p.optJSONObject("functionCall")
+                          val fc = parts.getJSONObject(i).optJSONObject("functionCall")
                           if (fc != null && tool == null) {
                               tool = fc.optString("name")
                               input = fc.optJSONObject("args") ?: JSONObject()
                           }
                       }
                   }
-                  return Reply(text.trim(), tool, input)
+                  return Reply(textOf(parts), tool, input)
+              }
+
+              // Live jankari: Google Search ke saath alag request (function calling ke bina).
+              fun search(key: String, query: String): String {
+                  val sys = "Tum Jarvis ho. Google Search se taaza jaankari lekar Hinglish mein, Roman script mein, " +
+                      "2 se 4 chhote vakya mein jawab do. Koi markdown, list ya emoji nahi."
+                  val contents = JSONArray().put(JSONObject().put("role", "user")
+                      .put("parts", JSONArray().put(JSONObject().put("text", query))))
+                  val res = withModels { m ->
+                      post(key, m, JSONObject()
+                          .put("systemInstruction", sysInstr(sys))
+                          .put("contents", contents)
+                          .put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
+                          .put("generationConfig", gen(m)))
+                  }
+                  return textOf(partsOf(res))
               }
           }
           SAATHI_EOF
@@ -297,27 +409,33 @@ jobs:
                   col.addView(info)
 
                   val key = EditText(this).apply {
-                      hint = "Gemini API key (aistudio.google.com se)"
+                                        hint = "Gemini API key (aistudio.google.com se)"
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                       setText(Prefs.key(this@MainActivity))
                   }
                   col.addView(key)
+                  val pv = EditText(this).apply {
+                      hint = "Picovoice AccessKey (optional, Jarvis bolne ke liye)"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setText(Prefs.pvKey(this@MainActivity))
+                  }
+                  col.addView(pv)
                   fun add(label: String, f: () -> Unit) =
                       col.addView(Button(this).apply { text = label; isAllCaps = false; setOnClickListener { f() } })
 
-                  add("1. API key save karo") {
-                      Prefs.setKey(this, key.text.toString()); info.text = "Key save ho gayi."
+                  add("1. Keys save karo") {
+                      Prefs.setKey(this, key.text.toString()); Prefs.setPvKey(this, pv.text.toString()); info.text = "Keys save ho gayi."
                   }
                   add("2. Overlay permission do") {
                       startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
                   }
-                  add("3. Mic aur notification permission do") {
-                      val perms = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                  add("3. Mic, contacts aur notification permission do") {
+                      val perms = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_CONTACTS)
                       if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
                       requestPermissions(perms.toTypedArray(), 1)
                   }
                   add("4. Jarvis bubble shuru karo") {
-                      Prefs.setKey(this, key.text.toString())
+                      Prefs.setKey(this, key.text.toString()); Prefs.setPvKey(this, pv.text.toString())
                       when {
                           Prefs.key(this).isBlank() -> info.text = "Pehle API key daalo."
                           !Settings.canDrawOverlays(this) -> info.text = "Step 2: overlay permission do."
@@ -340,21 +458,28 @@ jobs:
           package com.saathi.app
 
           import android.annotation.SuppressLint
+          import ai.picovoice.porcupine.Porcupine
+          import ai.picovoice.porcupine.PorcupineManager
+          import android.Manifest
+          import android.app.KeyguardManager
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.PendingIntent
           import android.app.Service
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
           import android.graphics.Color
           import android.graphics.PixelFormat
           import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.os.Handler
           import android.os.IBinder
           import android.os.Looper
           import android.provider.AlarmClock
+          import android.provider.ContactsContract.CommonDataKinds.Phone
           import android.provider.Settings
           import android.speech.RecognitionListener
           import android.speech.RecognizerIntent
@@ -393,6 +518,10 @@ jobs:
               private var mode = 0 // 0 = pehli baar sunna, 1 = follow-up, 2 = haan/nahi
               private val history = ArrayList<Pair<String, String>>()
               private val hide = Runnable { removeCard() }
+              private var wake: PorcupineManager? = null
+              private var wakeOn = false
+              private var wakeFailed = false
+              private var dead = false
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -405,7 +534,7 @@ jobs:
                   if (i?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
                   startAsForeground()
                   if (!Settings.canDrawOverlays(this)) { stopSelf(); return START_NOT_STICKY }
-                  if (bubble == null) { addBubble(); initTts() }
+                  if (bubble == null) { addBubble(); initTts(); startWake(true) }
                   return START_NOT_STICKY
               }
 
@@ -417,7 +546,7 @@ jobs:
                   val n = NotificationCompat.Builder(this, "saathi")
                       .setSmallIcon(android.R.drawable.ic_btn_speak_now)
                       .setContentTitle("Jarvis chal raha hai")
-                      .setContentText("Bubble dabao aur bolo")
+                      .setContentText("Bubble dabao ya Jarvis bolo")
                       .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Band karo", stop)
                       .setOngoing(true).build()
                   ServiceCompat.startForeground(this, 1, n,
@@ -460,10 +589,54 @@ jobs:
                   bubble = v
               }
 
+              private fun isLocked() = (getSystemService(KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
+
               private fun onBubbleTap() {
+                  // Phone lock ho to Jarvis kuch nahi sunega.
+                  if (isLocked()) return
+                  beginListening()
+              }
+
+              private fun beginListening() {
                   tts?.stop(); afterSpeak = null; pending = null
                   ui.removeCallbacks(hide)
-                  listen(0)
+                  val wasOn = wakeOn
+                  stopWake()
+                  ui.postDelayed({ listen(0) }, if (wasOn) 400L else 0L)
+              }
+
+              // ---------- Wake word: "Jarvis" ----------
+              private fun onWake() {
+                  if (dead || isLocked()) return
+                  beginListening()
+              }
+
+              private fun startWake(announce: Boolean) {
+                  if (dead || wakeFailed || wakeOn) return
+                                    val key = Prefs.pvKey(this)
+                  if (key.isBlank()) return
+                  try {
+                      val m = wake ?: PorcupineManager.Builder()
+                          .setAccessKey(key)
+                          .setKeyword(Porcupine.BuiltInKeyword.JARVIS)
+                          .setSensitivity(0.65f)
+                          .build(applicationContext) { ui.post { onWake() } }
+                      wake = m
+                      m.start()
+                      wakeOn = true
+                      if (announce) { show("Jarvis bolo, main sun raha hoon."); scheduleHide(3000) }
+                  } catch (e: Exception) {
+                      wakeFailed = true
+                      wake = null
+                      show("Wake word nahi chala: " + (e.message ?: e.javaClass.simpleName).take(120))
+                      scheduleHide(8000)
+                  }
+              }
+
+              private fun stopWake() {
+                  if (!wakeOn) return
+                  try { wake?.stop() } catch (_: Exception) {}
+                  wakeOn = false
               }
 
               // ---------- Popup card ----------
@@ -477,7 +650,7 @@ jobs:
                       background = GradientDrawable().apply { setColor(0xF2172232.toInt()); cornerRadius = dp(16).toFloat() }
                   }
                   status = TextView(this).apply { setTextColor(Color.WHITE); textSize = 16f; maxLines = 8 }
-                                    yesBtn = btn("Haan") { confirm(true) }
+                  yesBtn = btn("Haan") { confirm(true) }
                   noBtn = btn("Nahi") { confirm(false) }
                   val row = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
@@ -504,6 +677,7 @@ jobs:
                   ui.removeCallbacks(hide)
                   card?.let { try { wm.removeView(it) } catch (_: Exception) {} }
                   card = null; status = null; yesBtn = null; noBtn = null
+                  startWake(false)
               }
 
               private fun scheduleHide(ms: Long) { ui.removeCallbacks(hide); ui.postDelayed(hide, ms) }
@@ -539,9 +713,9 @@ jobs:
               private fun stopListening() { rec?.let { it.cancel(); it.destroy() }; rec = null }
 
               private fun listen(m: Int) {
-                  stopListening(); mode = m
+                  stopWake(); stopListening(); mode = m
                   if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-                      show("Is phone par speech recognition available nahi hai."); return
+                      show("Is phone par speech recognition available nahi hai."); scheduleHide(4000); return
                   }
                   val r = SpeechRecognizer.createSpeechRecognizer(this)
                   rec = r
@@ -567,6 +741,10 @@ jobs:
                       putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                       putExtra(RecognizerIntent.EXTRA_LANGUAGE, "hi-IN") // English ke liye "en-IN"
                       putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                      putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000L)
+                      putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+                      putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1000L)
+                      putExtra("android.speech.extra.ADDITIONAL_LANGUAGES", arrayOf("en-IN"))
                   })
               }
 
@@ -590,8 +768,9 @@ jobs:
                   while (history.size > 12 || (history.isNotEmpty() && history[0].first != "user")) history.removeAt(0)
                   show("“$text”\nSoch raha hoon…")
                   val snap = history.toList()
+                  val mem = Prefs.memory(this)
                   io.execute {
-                      val r = runCatching { Gemini.ask(key, snap) }
+                      val r = runCatching { Gemini.ask(key, snap, mem) }
                       ui.post {
                           r.onSuccess { handle(it) }.onFailure {
                               history.removeLastOrNull()
@@ -610,6 +789,9 @@ jobs:
                   else -> "Kuch gadbad ho gayi."
               }
 
+              private val confirmTools = setOf("set_alarm", "set_timer", "call_contact", "whatsapp_message", "forget")
+              private val countryCode = "91" // 10 digit number ke aage ye code lagta hai (India)
+
               private fun handle(r: Reply) {
                   val tool = r.tool; val input = r.input
                   if (tool != null && input != null) {
@@ -620,8 +802,12 @@ jobs:
                           return
                       }
                       history.add("assistant" to d)
-                      pending = { run(tool, input) }
-                      speak("$d Karoon? Haan ya nahi bolo.") { listen(2) }
+                      if (tool in confirmTools) {
+                          pending = { run(tool, input) }
+                          speak("$d Karoon? Haan ya nahi bolo.") { listen(2) }
+                                                } else {
+                          run(tool, input)
+                      }
                       return
                   }
                   val t = r.text.ifBlank { "Samajh nahi aaya, dobara bolo." }
@@ -629,7 +815,7 @@ jobs:
                   speak(t) { listen(1) }
               }
 
-              // ---------- Phone ke kaam (sirf confirm ke baad) ----------
+              // ---------- Phone ke kaam ----------
               private fun fmt(s: Int): String {
                   val parts = ArrayList<String>()
                   if (s / 3600 > 0) parts.add("${s / 3600} ghanta")
@@ -638,34 +824,135 @@ jobs:
                   return parts.joinToString(" ")
               }
 
-              private fun describe(tool: String, i: JSONObject): String? = when (tool) {
-                  "set_alarm" -> {
-                      val h = i.optInt("hour", -1); val m = i.optInt("minute", -1)
-                      if (h in 0..23 && m in 0..59) "%02d:%02d baje ka alarm set".format(h, m) else null
+              private fun describe(tool: String, i: JSONObject): String? {
+                  fun s(k: String) = i.optString(k).trim()
+                  return when (tool) {
+                      "set_alarm" -> {
+                          val h = i.optInt("hour", -1); val m = i.optInt("minute", -1)
+                          if (h in 0..23 && m in 0..59) "%02d:%02d baje ka alarm set".format(h, m) else null
+                      }
+                      "set_timer" -> {
+                          val sec = i.optInt("seconds", -1)
+                          if (sec in 1..86400) "${fmt(sec)} ka timer" else null
+                      }
+                      "call_contact" -> if (s("to").isNotEmpty()) "${s("to")} ko call karne ke liye dialer kholna" else null
+                      "whatsapp_message" ->
+                          if (s("to").isNotEmpty() && s("text").isNotEmpty())
+                              "${s("to")} ko WhatsApp par ye message bhejne ka draft kholna: ${s("text")}" else null
+                      "open_app" -> if (s("app").isNotEmpty()) "${s("app")} app kholna" else null
+                      "navigate_to" -> if (s("place").isNotEmpty()) "Maps mein ${s("place")} dhoondhna" else null
+                      "play_youtube" -> if (s("query").isNotEmpty()) "YouTube par ${s("query")} dhoondhna" else null
+                      "remember" -> if (s("fact").isNotEmpty()) "Ye yaad rakhna: ${s("fact")}" else null
+                      "forget" -> if (s("keyword").isNotEmpty()) "Yaad ki hui ${s("keyword")} wali baatein bhulana" else null
+                      "web_search" -> if (s("query").isNotEmpty()) "Internet par ${s("query")} dhoondhna" else null
+                      else -> null
                   }
-                  "set_timer" -> {
-                      val s = i.optInt("seconds", -1)
-                      if (s in 1..86400) "${fmt(s)} ka timer" else null
+              }
+
+              private fun done(msg: String) = speak(msg) { scheduleHide(3000) }
+
+              private fun go(intent: Intent, msg: String) {
+                  try {
+                      startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                      done(msg)
+                  } catch (_: Exception) {
+                      done("Ye phone par nahi ho paya.")
                   }
-                  else -> null
+              }
+
+              private fun findNumber(q: String): String? {
+                  val digits = q.filter { it.isDigit() || it == '+' }
+                  if (digits.count { it.isDigit() } >= 7) return digits
+                  if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
+                  val c = contentResolver.query(
+                      Phone.CONTENT_URI, arrayOf(Phone.NUMBER), Phone.DISPLAY_NAME + " LIKE ?", arrayOf("%" + q + "%"), null
+                  ) ?: return null
+                  try {
+                      return if (c.moveToFirst()) c.getString(0) else null
+                  } finally {
+                      c.close()
+                  }
+              }
+
+              private fun waNumber(n: String): String {
+                  val d = n.filter { it.isDigit() }
+                  if (n.trim().startsWith("+")) return d
+                  val t = d.trimStart('0')
+                  return if (t.length == 10) countryCode + t else t
+              }
+
+              private fun findApp(name: String): Intent? {
+                  val pm = packageManager
+                  val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val list = pm.queryIntentActivities(q, 0)
+                  val n = name.lowercase().trim()
+                  val hit = list.firstOrNull { it.loadLabel(pm).toString().lowercase() == n }
+                      ?: list.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(n) }
+                  return hit?.let { pm.getLaunchIntentForPackage(it.activityInfo.packageName) }
+              }
+
+              private fun search(q: String) {
+                  val key = Prefs.key(this)
+                  show("Dhoondh raha hoon…")
+                  io.execute {
+                      val r = runCatching { Gemini.search(key, q) }
+                      ui.post {
+                          r.onSuccess { t ->
+                              val txt = t.ifBlank { "Kuch mila nahi." }
+                              if (history.isNotEmpty() && history.last().first == "assistant") history.removeAt(history.lastIndex)
+                              history.add("assistant" to txt)
+                              speak(txt) { listen(1) }
+                          }.onFailure { speak(errMsg(it)) { scheduleHide(4000) } }
+                      }
+                  }
               }
 
               private fun run(tool: String, i: JSONObject) {
-                  val label = i.optString("label", "Jarvis")
-                  val intent = when (tool) {
-                      "set_alarm" -> Intent(AlarmClock.ACTION_SET_ALARM)
-                          .putExtra(AlarmClock.EXTRA_HOUR, i.getInt("hour"))
-                          .putExtra(AlarmClock.EXTRA_MINUTES, i.getInt("minute"))
-                      "set_timer" -> Intent(AlarmClock.ACTION_SET_TIMER)
-                          .putExtra(AlarmClock.EXTRA_LENGTH, i.getInt("seconds"))
-                      else -> return
-                  }.putExtra(AlarmClock.EXTRA_MESSAGE, label)
-                      .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                  try {
-                      startActivity(intent); speak("Ho gaya.") { scheduleHide(2500) }
-                  } catch (_: Exception) {
-                      speak("Ye phone par nahi ho paya.") { scheduleHide(3000) }
+                  fun s(k: String) = i.optString(k).trim()
+                  when (tool) {
+                      "set_alarm", "set_timer" -> {
+                          val label = s("label").ifBlank { "Jarvis" }
+                          val intent = if (tool == "set_alarm")
+                              Intent(AlarmClock.ACTION_SET_ALARM)
+                                  .putExtra(AlarmClock.EXTRA_HOUR, i.getInt("hour"))
+                                  .putExtra(AlarmClock.EXTRA_MINUTES, i.getInt("minute"))
+                          else
+                              Intent(AlarmClock.ACTION_SET_TIMER).putExtra(AlarmClock.EXTRA_LENGTH, i.getInt("seconds"))
+                          intent.putExtra(AlarmClock.EXTRA_MESSAGE, label).putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                          go(intent, "Ho gaya.")
+                      }
+                      "call_contact" -> {
+                          val n = findNumber(s("to"))
+                          if (n == null) done("${s("to")} ka number nahi mila. Contacts ki permission check karo.")
+                          else go(Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(n))), "Dialer khol diya. Call aap dabana.")
+                      }
+                      "whatsapp_message" -> {
+                          val n = findNumber(s("to"))
+                          if (n == null) {
+                              done("${s("to")} ka number nahi mila. Contacts ki permission check karo.")
+                          } else {
+                              val uri = Uri.parse("https://wa.me/" + waNumber(n) + "?text=" + Uri.encode(s("text")))
+                              try {
+                                  startActivity(Intent(Intent.ACTION_VIEW, uri).setPackage("com.whatsapp")
+                                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                  done("WhatsApp khol diya. Send aap dabana.")
+                              } catch (_: Exception) {
+                                  go(Intent(Intent.ACTION_VIEW, uri), "WhatsApp khol raha hoon. Send aap dabana.")
+                              }
+                          }
+                      }
+                      "open_app" -> {
+                          val launch = findApp(s("app"))
+                          if (launch == null) done("${s("app")} app nahi mili.") else go(launch, "${s("app")} khol raha hoon.")
+                      }
+                      "navigate_to" -> go(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(s("place")))),
+                          "Maps mein dhoondh raha hoon.")
+                      "play_youtube" -> go(Intent(Intent.ACTION_VIEW,
+                          Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(s("query")))),
+                          "YouTube par dhoondh raha hoon.")
+                      "remember" -> { Prefs.addMemory(this, s("fact")); done("Yaad rakh liya.") }
+                      "forget" -> { val n = Prefs.forget(this, s("keyword")); done("$n baatein bhula di.") }
+                      "web_search" -> search(s("query"))
                   }
               }
 
@@ -684,6 +971,9 @@ jobs:
               }
 
               override fun onDestroy() {
+                  dead = true
+                  try { wake?.stop(); wake?.delete() } catch (_: Exception) {}
+                  wake = null
                   ui.removeCallbacksAndMessages(null)
                   stopListening(); tts?.shutdown(); io.shutdownNow()
                   removeCard()
