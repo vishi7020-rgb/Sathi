@@ -43,12 +43,21 @@ jobs:
           android {
               namespace = "com.saathi.app"
               compileSdk = 34
+              signingConfigs {
+                  getByName("debug") {
+                      storeFile = file("debug.keystore")
+                      storePassword = "android"
+                      keyAlias = "androiddebugkey"
+                      keyPassword = "android"
+                  }
+              }
               defaultConfig {
                   applicationId = "com.saathi.app"
                   minSdk = 26
                   targetSdk = 34
                   versionCode = 1
                   versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
               }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
@@ -59,7 +68,9 @@ jobs:
           dependencies {
               implementation("androidx.core:core-ktx:1.13.1")
               implementation("androidx.security:security-crypto:1.1.0-alpha06")
-              implementation("ai.picovoice:porcupine-android:[3.0.0,5.0.0)")
+              implementation("net.java.dev.jna:jna:5.18.1@aar")
+              implementation("com.alphacephei:vosk-android:0.3.75")
+              implementation("com.alphacephei:vosk-model-en:0.3.70")
           }
           SAATHI_EOF
           cat > Saathi/app/src/main/AndroidManifest.xml <<'SAATHI_EOF'
@@ -174,8 +185,8 @@ jobs:
               fun key(c: Context): String = sp(c).getString("k", "") ?: ""
               fun setKey(c: Context, v: String) = sp(c).edit().putString("k", v.trim()).apply()
 
-              fun pvKey(c: Context): String = sp(c).getString("pv", "") ?: ""
-              fun setPvKey(c: Context, v: String) = sp(c).edit().putString("pv", v.trim()).apply()
+              fun wakeEnabled(c: Context): Boolean = sp(c).getBoolean("wake", true)
+              fun setWake(c: Context, v: Boolean) = sp(c).edit().putBoolean("wake", v).apply()
 
               fun memory(c: Context): List<String> = try {
                   val a = JSONArray(sp(c).getString("mem", "[]"))
@@ -208,7 +219,7 @@ jobs:
           import org.json.JSONArray
           import org.json.JSONObject
           import java.io.IOException
-          import java.net.HttpURLConnection
+                    import java.net.HttpURLConnection
           import java.net.URL
           import java.text.SimpleDateFormat
           import java.util.Date
@@ -220,11 +231,12 @@ jobs:
 
           object Gemini {
               // Pehla model na mile (404) to agla try hota hai.
-              private val MODELS = listOf("gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.6-flash")
+              private val MODELS = listOf("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash")
+              private val RETRYABLE = setOf(404, 429, 500, 503)
 
               private const val SYSTEM =
                   "Tum Jarvis ho, ek voice personal assistant. Jawab Hinglish mein, Roman script mein do " +
-                                    "(sirf tab English, jab user English mein baat kare). Jawab bolke sunaya jayega, isliye " +
+                  "(sirf tab English, jab user English mein baat kare). Jawab bolke sunaya jayega, isliye " +
                   "1 se 3 chhote vakya, koi markdown, list ya emoji nahi. Phone ke kaam (alarm, timer, call, " +
                   "WhatsApp, app kholna, maps, YouTube) ke liye function call karo; tum khud kuch nahi karte, " +
                   "call, message, alarm aur timer se pehle app user se haan puchhegi. Jab user kahe yaad rakhna, " +
@@ -296,16 +308,22 @@ jobs:
               }
 
               private fun withModels(f: (String) -> JSONObject): JSONObject {
+                  // Server busy (503/500) ho to ek baar dobara, phir agla model. 404/429 par seedha agla model.
                   var last: ApiError? = null
                   for (m in MODELS) {
-                      try {
-                          return f(m)
-                      } catch (e: ApiError) {
-                          if (e.code != 404) throw e
-                          last = e
+                      var attempt = 0
+                      while (attempt < 2) {
+                          attempt++
+                          try {
+                              return f(m)
+                          } catch (e: ApiError) {
+                              if (e.code !in RETRYABLE) throw e
+                              last = e
+                              if ((e.code == 503 || e.code == 500) && attempt < 2) Thread.sleep(1200) else break
+                          }
                       }
                   }
-                  throw last ?: ApiError(404)
+                  throw last ?: ApiError(503)
               }
 
               private fun post(key: String, model: String, body: JSONObject): JSONObject {
@@ -378,7 +396,7 @@ jobs:
                           .put("contents", contents)
                           .put("tools", JSONArray().put(JSONObject().put("google_search", JSONObject())))
                           .put("generationConfig", gen(m)))
-                  }
+                                            }
                   return textOf(partsOf(res))
               }
           }
@@ -409,22 +427,21 @@ jobs:
                   col.addView(info)
 
                   val key = EditText(this).apply {
-                                        hint = "Gemini API key (aistudio.google.com se)"
+                      hint = "Gemini API key (aistudio.google.com se)"
                       inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                       setText(Prefs.key(this@MainActivity))
                   }
                   col.addView(key)
-                  val pv = EditText(this).apply {
-                      hint = "Picovoice AccessKey (optional, Jarvis bolne ke liye)"
-                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-                      setText(Prefs.pvKey(this@MainActivity))
+                  val wakeBox = CheckBox(this).apply {
+                      text = "Jarvis bolkar jagao (experimental, battery zyada)"
+                      isChecked = Prefs.wakeEnabled(this@MainActivity)
                   }
-                  col.addView(pv)
+                  col.addView(wakeBox)
                   fun add(label: String, f: () -> Unit) =
                       col.addView(Button(this).apply { text = label; isAllCaps = false; setOnClickListener { f() } })
 
-                  add("1. Keys save karo") {
-                      Prefs.setKey(this, key.text.toString()); Prefs.setPvKey(this, pv.text.toString()); info.text = "Keys save ho gayi."
+                  add("1. Settings save karo") {
+                      Prefs.setKey(this, key.text.toString()); Prefs.setWake(this, wakeBox.isChecked); info.text = "Settings save ho gayi."
                   }
                   add("2. Overlay permission do") {
                       startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
@@ -435,7 +452,7 @@ jobs:
                       requestPermissions(perms.toTypedArray(), 1)
                   }
                   add("4. Jarvis bubble shuru karo") {
-                      Prefs.setKey(this, key.text.toString()); Prefs.setPvKey(this, pv.text.toString())
+                      Prefs.setKey(this, key.text.toString()); Prefs.setWake(this, wakeBox.isChecked)
                       when {
                           Prefs.key(this).isBlank() -> info.text = "Pehle API key daalo."
                           !Settings.canDrawOverlays(this) -> info.text = "Step 2: overlay permission do."
@@ -458,8 +475,6 @@ jobs:
           package com.saathi.app
 
           import android.annotation.SuppressLint
-          import ai.picovoice.porcupine.Porcupine
-          import ai.picovoice.porcupine.PorcupineManager
           import android.Manifest
           import android.app.KeyguardManager
           import android.app.NotificationChannel
@@ -497,6 +512,11 @@ jobs:
           import androidx.core.app.NotificationCompat
           import androidx.core.app.ServiceCompat
           import org.json.JSONObject
+          import org.vosk.Model
+          import org.vosk.Recognizer
+          import org.vosk.android.RecognitionListener as VoskListener
+          import org.vosk.android.SpeechService
+          import java.io.File
           import java.util.Locale
           import java.util.concurrent.Executors
           import kotlin.math.abs
@@ -518,7 +538,11 @@ jobs:
               private var mode = 0 // 0 = pehli baar sunna, 1 = follow-up, 2 = haan/nahi
               private val history = ArrayList<Pair<String, String>>()
               private val hide = Runnable { removeCard() }
-              private var wake: PorcupineManager? = null
+              private var voskModel: Model? = null
+              private var voskRec: Recognizer? = null
+              private var speech: SpeechService? = null
+              private var wakePhrase = "jarvis"
+              private var wakeBusy = false
               private var wakeOn = false
               private var wakeFailed = false
               private var dead = false
@@ -574,7 +598,7 @@ jobs:
                   var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
                   v.setOnTouchListener { _, e ->
                       when (e.action) {
-                          MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY; moved = false }
+                                                MotionEvent.ACTION_DOWN -> { sx = lp.x; sy = lp.y; tx = e.rawX; ty = e.rawY; moved = false }
                           MotionEvent.ACTION_MOVE -> {
                               val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
                               if (abs(dx) > 10 || abs(dy) > 10) moved = true
@@ -605,38 +629,137 @@ jobs:
                   ui.postDelayed({ listen(0) }, if (wasOn) 400L else 0L)
               }
 
-              // ---------- Wake word: "Jarvis" ----------
+              // ---------- Wake word: "Jarvis" (offline, Vosk) ----------
               private fun onWake() {
                   if (dead || isLocked()) return
                   beginListening()
               }
 
+              private val wakeListener = object : VoskListener {
+                  override fun onPartialResult(hypothesis: String?) { check(hypothesis) }
+                  override fun onResult(hypothesis: String?) { check(hypothesis) }
+                  override fun onFinalResult(hypothesis: String?) { check(hypothesis) }
+                  override fun onError(exception: Exception?) {}
+                  override fun onTimeout() {}
+
+                  private fun check(h: String?) {
+                      if (!wakeOn || h == null) return
+                      val t = try {
+                          val j = JSONObject(h)
+                          j.optString("partial", j.optString("text", ""))
+                      } catch (_: Exception) {
+                          ""
+                      }
+                      if (t.replace(" ", "").contains(wakePhrase.replace(" ", ""))) ui.post { onWake() }
+                  }
+              }
+
+              private fun findModelAsset(path: String, depth: Int): String? {
+                  val names = assets.list(path) ?: return null
+                  if ("am" in names && "conf" in names) return path
+                  if (depth >= 3) return null
+                  for (n in names) {
+                      val sub = if (path.isEmpty()) n else "$path/$n"
+                      val hit = findModelAsset(sub, depth + 1)
+                      if (hit != null) return hit
+                  }
+                  return null
+              }
+
+              private fun copyAssetDir(src: String, dst: File) {
+                  val names = assets.list(src) ?: return
+                  if (names.isEmpty()) {
+                      try {
+                          dst.parentFile?.mkdirs()
+                          assets.open(src).use { i -> dst.outputStream().use { o -> i.copyTo(o) } }
+                      } catch (_: Exception) {}
+                  } else {
+                      dst.mkdirs()
+                      for (n in names) copyAssetDir(if (src.isEmpty()) n else "$src/$n", File(dst, n))
+                  }
+              }
+
+              private fun prepareModel(): File {
+                  val dir = File(filesDir, "vosk-model")
+                  val ready = File(dir, "READY")
+                  if (ready.exists()) return dir
+                  val src = findModelAsset("", 0) ?: throw IllegalStateException("Model files nahi mile")
+                  dir.deleteRecursively()
+                  copyAssetDir(src, dir)
+                  ready.writeText("1")
+                  return dir
+              }
+
+              // Model ki shabd-suchi mein dekhta hai ki jarvis shabd hai ya nahi.
+              private fun pickPhrase(dir: File): String {
+                  val want = setOf("jarvis", "jar", "vis")
+                  val have = HashSet<String>()
+                  val f = File(dir, "graph/words.txt")
+                  if (f.exists()) f.forEachLine { l -> val w = l.substringBefore(' '); if (w in want) have.add(w) }
+                  return when {
+                      "jarvis" in have -> "jarvis"
+                      "jar" in have && "vis" in have -> "jar vis"
+                      else -> "service"
+                  }
+              }
+
+              private fun showWakeError(e: Throwable) {
+                  show("Wake word nahi chala: " + (e.message ?: e.javaClass.simpleName).take(120))
+                  scheduleHide(8000)
+              }
+
+              private fun initWake(announce: Boolean) {
+                  if (wakeBusy) return
+                  wakeBusy = true
+                  if (announce) { show("Wake word taiyar ho raha hai, thoda ruko…"); scheduleHide(4000) }
+                  Thread {
+                      try {
+                          val dir = prepareModel()
+                          val phrase = pickPhrase(dir)
+                          val model = Model(dir.absolutePath)
+                          val rec = Recognizer(model, 16000.0f, "[\"" + phrase + "\", \"[unk]\"]")
+                          ui.post {
+                              wakeBusy = false
+                              if (dead) {
+                                  try { (rec as AutoCloseable).close(); (model as AutoCloseable).close() } catch (_: Throwable) {}
+                              } else {
+                                  voskModel = model; voskRec = rec; wakePhrase = phrase
+                                  startWake(announce)
+                              }
+                          }
+                      } catch (e: Throwable) {
+                          ui.post { wakeBusy = false; wakeFailed = true; showWakeError(e) }
+                      }
+                  }.start()
+              }
+
               private fun startWake(announce: Boolean) {
-                  if (dead || wakeFailed || wakeOn) return
-                                    val key = Prefs.pvKey(this)
-                  if (key.isBlank()) return
+                  if (dead || wakeFailed || wakeOn || !Prefs.wakeEnabled(this)) return
+                  val rec = voskRec
+                  if (rec == null) { initWake(announce); return }
                   try {
-                      val m = wake ?: PorcupineManager.Builder()
-                          .setAccessKey(key)
-                          .setKeyword(Porcupine.BuiltInKeyword.JARVIS)
-                          .setSensitivity(0.65f)
-                          .build(applicationContext) { ui.post { onWake() } }
-                      wake = m
-                      m.start()
+                      val s = SpeechService(rec, 16000.0f)
+                      s.startListening(wakeListener)
+                      speech = s
                       wakeOn = true
-                      if (announce) { show("Jarvis bolo, main sun raha hoon."); scheduleHide(3000) }
+                      if (announce) {
+                          if (wakePhrase == "jarvis") {
+                              show("Jarvis bolo, main sun raha hoon."); scheduleHide(3000)
+                          } else {
+                              show("Is model mein jarvis shabd nahi mila. Jagane ke liye service bolo."); scheduleHide(8000)
+                          }
+                      }
                   } catch (e: Exception) {
                       wakeFailed = true
-                      wake = null
-                      show("Wake word nahi chala: " + (e.message ?: e.javaClass.simpleName).take(120))
-                      scheduleHide(8000)
+                      showWakeError(e)
                   }
               }
 
               private fun stopWake() {
                   if (!wakeOn) return
-                  try { wake?.stop() } catch (_: Exception) {}
                   wakeOn = false
+                  try { speech?.stop(); speech?.shutdown() } catch (_: Throwable) {}
+                  speech = null
               }
 
               // ---------- Popup card ----------
@@ -691,7 +814,7 @@ jobs:
                               override fun onStart(id: String?) {}
                               override fun onDone(id: String?) { ui.post { val a = afterSpeak; afterSpeak = null; a?.invoke() } }
                               @Deprecated("Deprecated in Java")
-                              override fun onError(id: String?) { onDone(id) }
+                                                            override fun onError(id: String?) { onDone(id) }
                           })
                           ttsReady = true
                       }
@@ -784,6 +907,7 @@ jobs:
                   e is ApiError && (e.code == 401 || e.code == 403) -> "API key galat ya band lagti hai. Jarvis app mein dobara daalo."
                   e is ApiError && e.code == 400 -> "API key ya request mein gadbad hai, code 400. Key dobara check karo."
                   e is ApiError && e.code == 429 -> "Bahut zyada requests ho gayi. Thodi der baad try karo."
+                  e is ApiError && (e.code == 500 || e.code == 503) -> "Gemini abhi busy hai. Kuch der baad dobara bolo."
                   e is ApiError -> "Server se jawab nahi aaya, code ${e.code}."
                   e is java.io.IOException -> "Internet nahi chal raha."
                   else -> "Kuch gadbad ho gayi."
@@ -805,7 +929,7 @@ jobs:
                       if (tool in confirmTools) {
                           pending = { run(tool, input) }
                           speak("$d Karoon? Haan ya nahi bolo.") { listen(2) }
-                                                } else {
+                      } else {
                           run(tool, input)
                       }
                       return
@@ -871,7 +995,7 @@ jobs:
                       return if (c.moveToFirst()) c.getString(0) else null
                   } finally {
                       c.close()
-                  }
+                                        }
               }
 
               private fun waNumber(n: String): String {
@@ -972,8 +1096,10 @@ jobs:
 
               override fun onDestroy() {
                   dead = true
-                  try { wake?.stop(); wake?.delete() } catch (_: Exception) {}
-                  wake = null
+                  try { speech?.stop(); speech?.shutdown() } catch (_: Throwable) {}
+                  speech = null
+                  try { (voskRec as? AutoCloseable)?.close(); (voskModel as? AutoCloseable)?.close() } catch (_: Throwable) {}
+                  voskRec = null; voskModel = null
                   ui.removeCallbacksAndMessages(null)
                   stopListening(); tts?.shutdown(); io.shutdownNow()
                   removeCard()
@@ -981,6 +1107,46 @@ jobs:
                   super.onDestroy()
               }
           }
+          SAATHI_EOF
+          base64 -d > Saathi/app/debug.keystore <<'SAATHI_EOF'
+          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
           SAATHI_EOF
       - uses: gradle/actions/setup-gradle@v4
         with:
