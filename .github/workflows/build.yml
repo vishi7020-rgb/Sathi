@@ -232,13 +232,13 @@ jobs:
 
           object Gemini {
               // Pehla model na mile (404) to agla try hota hai.
-              private val MODELS = listOf("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash")
+              private val MODELS = listOf("gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.6-flash")
               private val RETRYABLE = setOf(404, 429, 500, 503)
 
               private const val SYSTEM =
                   "Tum Jarvis ho, ek voice personal assistant. Jawab Hinglish mein, Roman script mein do " +
                   "(sirf tab English, jab user English mein baat kare). Jawab bolke sunaya jayega, isliye " +
-                  "1 se 3 chhote vakya, koi markdown, list ya emoji nahi. Phone ke kaam (alarm, timer, call, " +
+                  "1 se 2 chhote vakya, koi markdown, list ya emoji nahi. Phone ke kaam (alarm, timer, call, " +
                   "WhatsApp, app kholna, maps, YouTube) ke liye function call karo; tum khud kuch nahi karte, " +
                   "call, message, alarm aur timer se pehle app user se haan puchhegi. Jab user kahe yaad rakhna, " +
                   "remember function use karo. Taaza jaankari (khabar, score, mausam, price) ke liye web_search " +
@@ -271,9 +271,9 @@ jobs:
                           listOf("seconds")))
                       .put(fn("call_contact", "Kisi ko call karne ke liye dialer kholna.",
                           props("to" to text("Contact ka naam Roman script mein, jaise Mummy, ya phone number")),
-                                                    listOf("to")))
+                          listOf("to")))
                       .put(fn("whatsapp_message", "WhatsApp par message ka draft kholna. User khud send dabata hai.",
-                          props("to" to text("Contact ka naam Roman script mein, ya phone number"),
+                                                props("to" to text("Contact ka naam Roman script mein, ya phone number"),
                               "text" to text("Message ka text")), listOf("to", "text")))
                       .put(fn("open_app", "Phone ki koi app kholna.",
                           props("app" to text("App ka naam English mein, jaise WhatsApp, YouTube, Camera, Settings")),
@@ -303,7 +303,7 @@ jobs:
                   JSONObject().put("parts", JSONArray().put(JSONObject().put("text", t)))
 
               private fun gen(m: String): JSONObject {
-                  val g = JSONObject().put("maxOutputTokens", 1024)
+                  val g = JSONObject().put("maxOutputTokens", if (m.startsWith("gemini-2.5")) 400 else 1024)
                   if (m.startsWith("gemini-2.5")) g.put("thinkingConfig", JSONObject().put("thinkingBudget", 0))
                   return g
               }
@@ -320,7 +320,10 @@ jobs:
                           } catch (e: ApiError) {
                               if (e.code !in RETRYABLE) throw e
                               last = e
-                              if ((e.code == 503 || e.code == 500) && attempt < 2) Thread.sleep(1200) else break
+                              if ((e.code == 503 || e.code == 500) && attempt < 2) Thread.sleep(600) else break
+                          } catch (e: java.net.SocketTimeoutException) {
+                              last = ApiError(504)
+                              break
                           }
                       }
                   }
@@ -332,7 +335,7 @@ jobs:
                       .openConnection() as HttpURLConnection
                   c.requestMethod = "POST"
                   c.connectTimeout = 15000
-                  c.readTimeout = 60000
+                  c.readTimeout = 20000
                   c.doOutput = true
                   c.setRequestProperty("x-goog-api-key", key)
                   c.setRequestProperty("Content-Type", "application/json")
@@ -508,6 +511,8 @@ jobs:
           import android.graphics.Color
           import android.graphics.PixelFormat
           import android.graphics.drawable.GradientDrawable
+          import android.media.AudioManager
+          import android.media.ToneGenerator
           import android.net.Uri
           import android.os.Build
           import android.os.Bundle
@@ -521,8 +526,8 @@ jobs:
           import android.speech.RecognizerIntent
           import android.speech.SpeechRecognizer
           import android.speech.tts.TextToSpeech
-                    import android.speech.tts.UtteranceProgressListener
-          import android.view.Gravity
+          import android.speech.tts.UtteranceProgressListener
+                    import android.view.Gravity
           import android.view.MotionEvent
           import android.view.View
           import android.view.WindowManager
@@ -572,6 +577,7 @@ jobs:
               private var heard = ""
               private var heardAt = 0L
               private var wakeBusy = false
+              private var tone: ToneGenerator? = null
               private var wakeOn = false
               private var wakeFailed = false
               private var dead = false
@@ -655,6 +661,14 @@ jobs:
                   bubble = v
               }
 
+              // Chhoti beep: ready=true "ab bolo", ready=false "samajh liya, soch raha hoon".
+              private fun beep(ready: Boolean) {
+                  try {
+                      if (tone == null) tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80)
+                      tone?.startTone(if (ready) ToneGenerator.TONE_PROP_BEEP else ToneGenerator.TONE_PROP_ACK, 120)
+                  } catch (_: Throwable) {}
+              }
+
               private fun isLocked() = (getSystemService(KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
 
               private fun onBubbleTap() {
@@ -668,7 +682,7 @@ jobs:
                   ui.removeCallbacks(hide)
                   val wasOn = wakeOn
                   stopWake()
-                  ui.postDelayed({ listen(0) }, if (wasOn) 400L else 0L)
+                  ui.postDelayed({ listen(0) }, if (wasOn) 120L else 0L)
               }
 
               // ---------- Wake word: "Jarvis" (offline, Vosk) ----------
@@ -796,12 +810,12 @@ jobs:
                       root.deleteRecursively()
                       downloadModel(root)
                       ready.writeText("1")
-                  }
+                                        }
                   return findModelDir(root, 0) ?: throw IllegalStateException("Model files nahi mile")
               }
 
               // Jo shabd model ko nahi pata, Vosk use chupchap chhod deta hai. Isliye milte-julte shabd bhi saath dete hain.
-                            private fun pickPhrases(wanted: String): List<String> {
+              private fun pickPhrases(wanted: String): List<String> {
                   val w = wanted.trim().lowercase().split(" ").filter { it.isNotEmpty() }.joinToString(" ").ifEmpty { "jarvis" }
                   val out = ArrayList<String>()
                   out.add(w)
@@ -951,7 +965,7 @@ jobs:
                   val r = SpeechRecognizer.createSpeechRecognizer(this)
                   rec = r
                   r.setRecognitionListener(object : RecognitionListener {
-                      override fun onReadyForSpeech(p: Bundle?) { if (m != 2) show("Sun raha hoon…") }
+                      override fun onReadyForSpeech(p: Bundle?) { beep(true); if (m != 2) show("Sun raha hoon…") }
                       override fun onBeginningOfSpeech() {}
                       override fun onRmsChanged(v: Float) {}
                       override fun onBufferReceived(b: ByteArray?) {}
@@ -960,6 +974,7 @@ jobs:
                       override fun onPartialResults(b: Bundle?) { if (m != 2) first(b)?.let { show("“$it”") } }
                       override fun onResults(b: Bundle?) {
                           val t = first(b); stopListening()
+                          if (!t.isNullOrBlank()) beep(false)
                           when {
                               t.isNullOrBlank() -> fail(SpeechRecognizer.ERROR_NO_MATCH)
                               m == 2 -> confirm(isYes(t))
@@ -1048,9 +1063,9 @@ jobs:
               }
 
               // ---------- Phone ke kaam ----------
-              private fun fmt(s: Int): String {
+                            private fun fmt(s: Int): String {
                   val parts = ArrayList<String>()
-                                    if (s / 3600 > 0) parts.add("${s / 3600} ghanta")
+                  if (s / 3600 > 0) parts.add("${s / 3600} ghanta")
                   if (s % 3600 / 60 > 0) parts.add("${s % 3600 / 60} minute")
                   if (s % 60 > 0) parts.add("${s % 60} second")
                   return parts.joinToString(" ")
@@ -1204,6 +1219,7 @@ jobs:
 
               override fun onDestroy() {
                   dead = true
+                  try { tone?.release() } catch (_: Throwable) {}
                   try { speech?.stop(); speech?.shutdown() } catch (_: Throwable) {}
                   speech = null
                   try { (voskRec as? AutoCloseable)?.close(); (voskModel as? AutoCloseable)?.close() } catch (_: Throwable) {}
