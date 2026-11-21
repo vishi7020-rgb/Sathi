@@ -271,9 +271,9 @@ jobs:
                           listOf("seconds")))
                       .put(fn("call_contact", "Kisi ko call karne ke liye dialer kholna.",
                           props("to" to text("Contact ka naam Roman script mein, jaise Mummy, ya phone number")),
-                          listOf("to")))
+                                                    listOf("to")))
                       .put(fn("whatsapp_message", "WhatsApp par message ka draft kholna. User khud send dabata hai.",
-                                                props("to" to text("Contact ka naam Roman script mein, ya phone number"),
+                          props("to" to text("Contact ka naam Roman script mein, ya phone number"),
                               "text" to text("Message ka text")), listOf("to", "text")))
                       .put(fn("open_app", "Phone ki koi app kholna.",
                           props("app" to text("App ka naam English mein, jaise WhatsApp, YouTube, Camera, Settings")),
@@ -521,7 +521,7 @@ jobs:
           import android.speech.RecognizerIntent
           import android.speech.SpeechRecognizer
           import android.speech.tts.TextToSpeech
-          import android.speech.tts.UtteranceProgressListener
+                    import android.speech.tts.UtteranceProgressListener
           import android.view.Gravity
           import android.view.MotionEvent
           import android.view.View
@@ -530,7 +530,7 @@ jobs:
           import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.TextView
-                    import androidx.core.app.NotificationCompat
+          import androidx.core.app.NotificationCompat
           import androidx.core.app.ServiceCompat
           import org.json.JSONArray
           import org.json.JSONObject
@@ -800,19 +800,12 @@ jobs:
                   return findModelDir(root, 0) ?: throw IllegalStateException("Model files nahi mile")
               }
 
-              // Model ki shabd-suchi mein dekhta hai ki shabd hai ya nahi. Nahi ho to milte-julte shabd.
-              private fun pickPhrases(dir: File, wanted: String): List<String> {
-                  val words = wanted.trim().lowercase().split(" ").filter { it.isNotEmpty() }
-                  val w = if (words.isEmpty()) listOf("jarvis") else words
-                  val need = HashSet<String>(w)
-                  need.addAll(listOf("jar", "vis", "service"))
-                  val have = HashSet<String>()
-                  val f = File(dir, "graph/words.txt")
-                  if (f.exists()) f.forEachLine { l -> val x = l.substringBefore(' '); if (x in need) have.add(x) }
-                                    if (w.all { it in have }) return listOf(w.joinToString(" "))
+              // Jo shabd model ko nahi pata, Vosk use chupchap chhod deta hai. Isliye milte-julte shabd bhi saath dete hain.
+                            private fun pickPhrases(wanted: String): List<String> {
+                  val w = wanted.trim().lowercase().split(" ").filter { it.isNotEmpty() }.joinToString(" ").ifEmpty { "jarvis" }
                   val out = ArrayList<String>()
-                  if ("jar" in have && "vis" in have) out.add("jar vis")
-                  if ("service" in have) out.add("service")
+                  out.add(w)
+                  if (w == "jarvis") { out.add("jar vis"); out.add("service") }
                   return out
               }
 
@@ -831,8 +824,7 @@ jobs:
                   Thread {
                       try {
                           val dir = prepareModel()
-                          val phrases = pickPhrases(dir, Prefs.wakeWord(this))
-                          if (phrases.isEmpty()) throw IllegalStateException("Model mein ye shabd nahi hai, koi aur shabd likho")
+                          val phrases = pickPhrases(Prefs.wakeWord(this))
                           val model = Model(dir.absolutePath)
                           val rec = Recognizer(model, 16000.0f, JSONArray(phrases + "[unk]").toString())
                           ui.post {
@@ -860,17 +852,10 @@ jobs:
                       s.startListening(wakeListener)
                       speech = s
                       wakeOn = true
-                      val said = wakePhrases.joinToString(" ya ")
-                      val wanted = Prefs.wakeWord(this).trim().lowercase()
-                      val exact = wakePhrases.size == 1 && wakePhrases[0] == wanted
-                      status("Wake sun raha hai. Bolo: " + said + (if (exact) "" else " (model mein '" + wanted + "' nahi mila)"))
-                      if (announce) {
-                          if (exact) {
-                              show("Wake word on. Bolo: " + said); scheduleHide(3000)
-                          } else {
-                              show("Model mein '" + wanted + "' nahi mila. Iski jagah bolo: " + said); scheduleHide(8000)
-                          }
-                      }
+                      val alt = wakePhrases.drop(1)
+                      val said = wakePhrases[0] + (if (alt.isEmpty()) "" else " (na jaage to: " + alt.joinToString(" ya ") + ")")
+                      status("Wake sun raha hai. Bolo: " + said)
+                      if (announce) { show("Wake word on. Bolo: " + said); scheduleHide(5000) }
                   } catch (e: Exception) {
                       wakeFailed = true
                       showWakeError(e)
@@ -1059,13 +1044,13 @@ jobs:
                   }
                   val t = r.text.ifBlank { "Samajh nahi aaya, dobara bolo." }
                   history.add("assistant" to t)
-                                    speak(t) { listen(1) }
+                  speak(t) { listen(1) }
               }
 
               // ---------- Phone ke kaam ----------
               private fun fmt(s: Int): String {
                   val parts = ArrayList<String>()
-                  if (s / 3600 > 0) parts.add("${s / 3600} ghanta")
+                                    if (s / 3600 > 0) parts.add("${s / 3600} ghanta")
                   if (s % 3600 / 60 > 0) parts.add("${s % 3600 / 60} minute")
                   if (s % 60 > 0) parts.add("${s % 60} second")
                   return parts.joinToString(" ")
