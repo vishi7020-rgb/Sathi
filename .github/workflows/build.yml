@@ -70,7 +70,6 @@ jobs:
               implementation("androidx.security:security-crypto:1.1.0-alpha06")
               implementation("net.java.dev.jna:jna:5.18.1@aar")
               implementation("com.alphacephei:vosk-android:0.3.75")
-              implementation("com.alphacephei:vosk-model-en:0.3.70")
           }
           SAATHI_EOF
           cat > Saathi/app/src/main/AndroidManifest.xml <<'SAATHI_EOF'
@@ -267,14 +266,14 @@ jobs:
                       .put(fn("set_alarm", "Alarm set karne ka prastav.",
                           props("hour" to prop("INTEGER", "0 se 23"), "minute" to prop("INTEGER", "0 se 59"),
                               "label" to text("Alarm ka naam")), listOf("hour", "minute")))
-                                                    .put(fn("set_timer", "Countdown timer ka prastav.",
+                      .put(fn("set_timer", "Countdown timer ka prastav.",
                           props("seconds" to prop("INTEGER", "Total seconds"), "label" to text("Timer ka naam")),
                           listOf("seconds")))
                       .put(fn("call_contact", "Kisi ko call karne ke liye dialer kholna.",
                           props("to" to text("Contact ka naam Roman script mein, jaise Mummy, ya phone number")),
                           listOf("to")))
                       .put(fn("whatsapp_message", "WhatsApp par message ka draft kholna. User khud send dabata hai.",
-                          props("to" to text("Contact ka naam Roman script mein, ya phone number"),
+                                                props("to" to text("Contact ka naam Roman script mein, ya phone number"),
                               "text" to text("Message ka text")), listOf("to", "text")))
                       .put(fn("open_app", "Phone ki koi app kholna.",
                           props("app" to text("App ka naam English mein, jaise WhatsApp, YouTube, Camera, Settings")),
@@ -504,7 +503,7 @@ jobs:
           import android.app.PendingIntent
           import android.app.Service
           import android.content.Intent
-                    import android.content.pm.PackageManager
+          import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
           import android.graphics.Color
           import android.graphics.PixelFormat
@@ -531,7 +530,7 @@ jobs:
           import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.TextView
-          import androidx.core.app.NotificationCompat
+                    import androidx.core.app.NotificationCompat
           import androidx.core.app.ServiceCompat
           import org.json.JSONArray
           import org.json.JSONObject
@@ -540,6 +539,11 @@ jobs:
           import org.vosk.android.RecognitionListener as VoskListener
           import org.vosk.android.SpeechService
           import java.io.File
+          import java.io.FileInputStream
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.zip.ZipInputStream
           import java.util.Locale
           import java.util.concurrent.Executors
           import kotlin.math.abs
@@ -700,40 +704,100 @@ jobs:
                   }
               }
 
-              private fun findModelAsset(path: String, depth: Int): String? {
-                  val names = assets.list(path) ?: return null
-                  if ("am" in names && "conf" in names) return path
+              // ---------- Model: pehli baar internet se download (~40 MB), phir hamesha phone mein ----------
+              private val modelUrls = listOf(
+                  "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+                  "https://huggingface.co/grimso/vosk-models/resolve/main/vosk-model-small-en-us-0.15.zip"
+              )
+
+              private fun downloadZip(url: String, zip: File) {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.connectTimeout = 20000
+                  c.readTimeout = 60000
+                  if (c.responseCode !in 200..299) throw IOException("Model download nahi hua, code " + c.responseCode)
+                  val total = c.contentLengthLong
+                  var done = 0L
+                  var lastPct = -1
+                  c.inputStream.use { i ->
+                      zip.outputStream().use { o ->
+                          val buf = ByteArray(65536)
+                          var n = i.read(buf)
+                          while (n > 0) {
+                              o.write(buf, 0, n)
+                              done += n
+                              if (total > 0) {
+                                  val pct = (done * 100 / total).toInt()
+                                  if (pct >= lastPct + 5) {
+                                      lastPct = pct
+                                      ui.post { status("Model download ho raha hai: " + pct + "%") }
+                                  }
+                              }
+                              n = i.read(buf)
+                          }
+                      }
+                  }
+              }
+
+              private fun unzip(zip: File, dst: File) {
+                  val base = dst.canonicalFile
+                  base.mkdirs()
+                  ZipInputStream(FileInputStream(zip).buffered(65536)).use { zin ->
+                      var e = zin.nextEntry
+                      while (e != null) {
+                          val out = File(base, e.name).canonicalFile
+                          if (!out.path.startsWith(base.path)) throw IOException("Galat zip file")
+                          if (e.isDirectory) {
+                              out.mkdirs()
+                          } else {
+                              out.parentFile?.mkdirs()
+                              out.outputStream().use { o -> zin.copyTo(o) }
+                          }
+                          e = zin.nextEntry
+                      }
+                  }
+              }
+
+              private fun downloadModel(root: File) {
+                  val zip = File(cacheDir, "vosk-model.zip")
+                  var err: Exception? = null
+                  for (u in modelUrls) {
+                      try {
+                          downloadZip(u, zip)
+                          err = null
+                          break
+                      } catch (e: Exception) {
+                          err = e
+                      }
+                  }
+                  if (err != null) throw err
+                  ui.post { status("Model khol raha hoon…") }
+                  unzip(zip, root)
+                  zip.delete()
+              }
+
+              private fun findModelDir(d: File, depth: Int): File? {
+                  val names = d.list() ?: return null
+                  if ("am" in names && "conf" in names) return d
                   if (depth >= 3) return null
                   for (n in names) {
-                      val sub = if (path.isEmpty()) n else "$path/$n"
-                      val hit = findModelAsset(sub, depth + 1)
-                      if (hit != null) return hit
+                      val f = File(d, n)
+                      if (f.isDirectory) {
+                          val hit = findModelDir(f, depth + 1)
+                          if (hit != null) return hit
+                      }
                   }
                   return null
               }
 
-              private fun copyAssetDir(src: String, dst: File) {
-                  val names = assets.list(src) ?: return
-                  if (names.isEmpty()) {
-                      try {
-                          dst.parentFile?.mkdirs()
-                          assets.open(src).use { i -> dst.outputStream().use { o -> i.copyTo(o) } }
-                      } catch (_: Exception) {}
-                  } else {
-                      dst.mkdirs()
-                      for (n in names) copyAssetDir(if (src.isEmpty()) n else "$src/$n", File(dst, n))
-                  }
-              }
-
               private fun prepareModel(): File {
-                  val dir = File(filesDir, "vosk-model")
-                  val ready = File(dir, "READY")
-                  if (ready.exists()) return dir
-                  val src = findModelAsset("", 0) ?: throw IllegalStateException("Model files nahi mile")
-                  dir.deleteRecursively()
-                  copyAssetDir(src, dir)
-                  ready.writeText("1")
-                  return dir
+                  val root = File(filesDir, "vosk-model")
+                  val ready = File(root, "READY")
+                  if (!ready.exists()) {
+                      root.deleteRecursively()
+                      downloadModel(root)
+                      ready.writeText("1")
+                  }
+                  return findModelDir(root, 0) ?: throw IllegalStateException("Model files nahi mile")
               }
 
               // Model ki shabd-suchi mein dekhta hai ki shabd hai ya nahi. Nahi ho to milte-julte shabd.
@@ -745,7 +809,7 @@ jobs:
                   val have = HashSet<String>()
                   val f = File(dir, "graph/words.txt")
                   if (f.exists()) f.forEachLine { l -> val x = l.substringBefore(' '); if (x in need) have.add(x) }
-                  if (w.all { it in have }) return listOf(w.joinToString(" "))
+                                    if (w.all { it in have }) return listOf(w.joinToString(" "))
                   val out = ArrayList<String>()
                   if ("jar" in have && "vis" in have) out.add("jar vis")
                   if ("service" in have) out.add("service")
@@ -763,12 +827,12 @@ jobs:
                   if (wakeBusy) return
                   wakeBusy = true
                   status("Wake word: model taiyar ho raha hai, thoda ruko…")
-                  if (announce) { show("Wake word taiyar ho raha hai, thoda ruko…"); scheduleHide(4000) }
+                  if (announce) { show("Wake word taiyar ho raha hai. Pehli baar 40 MB model download hoga, notification mein progress dekho."); scheduleHide(6000) }
                   Thread {
                       try {
                           val dir = prepareModel()
                           val phrases = pickPhrases(dir, Prefs.wakeWord(this))
-                                                    if (phrases.isEmpty()) throw IllegalStateException("Model mein ye shabd nahi hai, koi aur shabd likho")
+                          if (phrases.isEmpty()) throw IllegalStateException("Model mein ye shabd nahi hai, koi aur shabd likho")
                           val model = Model(dir.absolutePath)
                           val rec = Recognizer(model, 16000.0f, JSONArray(phrases + "[unk]").toString())
                           ui.post {
@@ -995,7 +1059,7 @@ jobs:
                   }
                   val t = r.text.ifBlank { "Samajh nahi aaya, dobara bolo." }
                   history.add("assistant" to t)
-                  speak(t) { listen(1) }
+                                    speak(t) { listen(1) }
               }
 
               // ---------- Phone ke kaam ----------
@@ -1008,7 +1072,7 @@ jobs:
               }
 
               private fun describe(tool: String, i: JSONObject): String? {
-                                fun s(k: String) = i.optString(k).trim()
+                  fun s(k: String) = i.optString(k).trim()
                   return when (tool) {
                       "set_alarm" -> {
                           val h = i.optInt("hour", -1); val m = i.optInt("minute", -1)
